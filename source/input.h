@@ -20,6 +20,7 @@ typedef struct {
     bool reset;       /* SELECT */
     bool throttleCut; /* R      */
     bool speedToggle; /* touch screen tap */
+    bool menu;        /* SELECT held for a second: back to map select */
 } Sticks;
 
 void inputInit(Sticks *s);

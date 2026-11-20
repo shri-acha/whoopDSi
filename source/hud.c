@@ -83,15 +83,55 @@ void hudInit(void)
     BG_PALETTE_SUB[C_DOT]    = RGB15(10, 31, 12);
     BG_PALETTE_SUB[C_TRAIL]  = RGB15(6, 20, 8);
 
+}
+
+/* Map menu rows on the bottom screen: map i is drawn on text rows
+ * MENU_ROW0 + i * MENU_STEP (name) and the row below it (description). */
+#define MENU_ROW0 6
+#define MENU_STEP 4
+
+int hudMenuHit(int py)
+{
+    int row = py / 8;
+    for (int i = 0; i < MAP_COUNT; i++) {
+        int r = MENU_ROW0 + i * MENU_STEP;
+        if (row >= r - 1 && row <= r + 2) return i;
+    }
+    return -1;
+}
+
+static void drawStatic(GameState state)
+{
     consoleSelect(&con);
     consoleClear();
+    for (int i = 0; i < 256 * 192 / 2; i++) bmp[i] = 0;
     iprintf("\x1b[0;0H  whoopDSi - tiny whoop FPV sim");
+    if (state == STATE_MENU) {
+        iprintf("\x1b[3;1HSELECT MAP");
+        iprintf("\x1b[18;1HUP/DOWN or tap   choose map");
+        iprintf("\x1b[19;1HA / START or tap again  fly");
+        iprintf("\x1b[21;1HIn flight, hold SELECT for");
+        iprintf("\x1b[22;1Hone second to come back here.");
+        return;
+    }
     iprintf("\x1b[17;3HTHR / YAW");
     iprintf("\x1b[17;20HPITCH / ROLL");
     iprintf("\x1b[19;0H UP/DOWN throttle LEFT/RIGHT yaw");
     iprintf("\x1b[20;0H X/B pitch        Y/A roll");
     iprintf("\x1b[21;0H START arm        L angle/acro");
     iprintf("\x1b[22;0H R throttle cut   SELECT reset");
+    iprintf("\x1b[23;0H hold SELECT      map select");
+}
+
+static void drawMenu(const Game *g)
+{
+    consoleSelect(&con);
+    for (int i = 0; i < MAP_COUNT; i++) {
+        int r = MENU_ROW0 + i * MENU_STEP;
+        bool sel = i == g->menuSel;
+        iprintf("\x1b[%d;1H%s %-10s", r, sel ? ">>" : "  ", mapInfo[i].name);
+        iprintf("\x1b[%d;4H%-26s", r + 1, mapInfo[i].desc);
+    }
 }
 
 static void fmtTime(char *buf, int frames)
@@ -105,6 +145,16 @@ void hudUpdate(const Game *g, int frame)
 {
     const Quad *q = &g->quad;
     const Sticks *s = &g->sticks;
+
+    static int shown = -1;
+    if ((int)g->state != shown) {
+        shown = g->state;
+        drawStatic(g->state);
+    }
+    if (g->state == STATE_MENU) {
+        drawMenu(g);
+        return;
+    }
 
     /* stick monitor every frame (cheap) */
     drawStickBox(LBOX_X, BOX_Y, s->rawYaw, s->throttle * 2.0f - 1.0f);
@@ -121,6 +171,7 @@ void hudUpdate(const Game *g, int frame)
     int altcm = (int)(q->pos.y * 100.0f);
 
     consoleSelect(&con);
+    iprintf("\x1b[1;1HMAP  %-8s", world->name);
     iprintf("\x1b[2;1HMODE %-6s %-10s      ",
             q->mode == MODE_ACRO ? "ACRO" : "ANGLE",
             q->crashed ? "CRASHED" : (q->armed ? "ARMED" : "DISARMED"));

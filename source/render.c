@@ -8,7 +8,7 @@
 /* Static scene, baked once into fixed-point quads with per-vertex colour.  */
 /* ------------------------------------------------------------------------ */
 
-#define MAX_RQUADS 900
+#define MAX_RQUADS 1200
 
 typedef struct {
     v16 v[4][3];
@@ -20,7 +20,11 @@ typedef struct {
 static RQuad rquads[MAX_RQUADS];
 static int numRQuads;
 
-#define M2V(f) ((v16)((f) * 4096.0f))   /* metres -> v16 (4.12 fixed) */
+/* Vertices are stored as v16 (4.12 fixed, range +-8) in units of
+ * WORLD_SCALE metres, and the modelview scales them back up. That keeps
+ * ~1 mm precision while letting maps reach +-32 m. */
+#define WORLD_SCALE 4
+#define M2V(f) ((v16)((f) * (4096.0f / WORLD_SCALE)))
 
 static u16 shadeRGB(int r, int g, int b, int shade /*0..32*/)
 {
@@ -54,6 +58,7 @@ static void quadColor(RQuad *q, u16 c0, u16 c1, u16 c2, u16 c3)
 
 static void bakeBox(const Box *bx)
 {
+    const MapInfo *m = world;
     float x0 = bx->mn.x, y0 = bx->mn.y, z0 = bx->mn.z;
     float x1 = bx->mx.x, y1 = bx->mx.y, z1 = bx->mx.z;
     /* face order: top, bottom, -X, +X, -Z, +Z with fake directional light */
@@ -67,12 +72,13 @@ static void bakeBox(const Box *bx)
         { {x0,y0,z1}, {x1,y0,z1}, {x1,y1,z1}, {x0,y1,z1} },
     };
     for (int i = 0; i < 6; i++) {
-        if (i == 1 && y0 < 0.001f) continue;              /* resting on the floor */
-        if (i == 0 && y1 > ROOM_H - 0.001f) continue;     /* touching the ceiling */
-        if (i == 2 && x0 < ROOM_MIN_X + 0.001f) continue; /* flush with a wall    */
-        if (i == 3 && x1 > ROOM_MAX_X - 0.001f) continue;
-        if (i == 4 && z0 < ROOM_MIN_Z + 0.001f) continue;
-        if (i == 5 && z1 > ROOM_MAX_Z - 0.001f) continue;
+        /* hidden faces: on the floor, on the ceiling, flush with a wall */
+        if (i == 1 && y0 < 0.001f) continue;
+        if (i == 0 && m->indoor && y1 > m->ceilH - 0.001f) continue;
+        if (i == 2 && x0 < m->minX + 0.001f) continue;
+        if (i == 3 && x1 > m->maxX - 0.001f) continue;
+        if (i == 4 && z0 < m->minZ + 0.001f) continue;
+        if (i == 5 && z1 > m->maxZ - 0.001f) continue;
         RQuad *q = addQuad(f[i][0], f[i][1], f[i][2], f[i][3]);
         if (!q) return;
         u16 c = shadeRGB(bx->r, bx->g, bx->b, shades[i]);
@@ -82,63 +88,168 @@ static void bakeBox(const Box *bx)
     }
 }
 
+/* ---- floor and walls ----------------------------------------------------
+ * Every surface is cut into tiles, and each tile is further split along the
+ * edges of the patches (rug, door, window...) that overlap it. Each piece
+ * gets the patch colour on top, or the surface colour, and then the same
+ * per-vertex lighting as the rest of the surface. Nothing is layered on top
+ * of anything else, so there is no z-fighting and no lighting mismatch. */
+
+typedef struct { int r, g, b; } RGB;
+
+static Vec3 surfPoint(Surface s, float u, float v)
+{
+    const MapInfo *m = world;
+    switch (s) {
+    case SURF_BACK:  return v3(u, v, m->minZ);
+    case SURF_FRONT: return v3(u, v, m->maxZ);
+    case SURF_LEFT:  return v3(m->minX, v, u);
+    case SURF_RIGHT: return v3(m->maxX, v, u);
+    default:         return v3(u, 0.0f, v);
+    }
+}
+
+/* vertex brightness: floors are flat-lit, walls darken toward the bottom */
+static int surfShade(Surface s, float v)
+{
+    if (s == SURF_FLOOR) return 32;
+    const MapInfo *m = world;
+    int lo = m->indoor ? 18 : 15, hi = m->indoor ? 31 : 28;
+    return lo + (int)((hi - lo) * v / m->wallH);
+}
+
+static int addEdges(float *e, int n, float lo, float hi, float a, float b)
+{
+    if (a > lo + 0.001f && a < hi - 0.001f) e[n++] = a;
+    if (b > lo + 0.001f && b < hi - 0.001f) e[n++] = b;
+    return n;
+}
+
+static void sortEdges(float *e, int n)
+{
+    for (int i = 1; i < n; i++) {
+        float t = e[i];
+        int j = i - 1;
+        while (j >= 0 && e[j] > t) { e[j + 1] = e[j]; j--; }
+        e[j + 1] = t;
+    }
+}
+
+static void bakeTile(Surface s, float u0, float v0, float u1, float v1, RGB base)
+{
+    float us[2 + 2 * MAX_PATCHES], vs[2 + 2 * MAX_PATCHES];
+    int nu = 0, nv = 0;
+    us[nu++] = u0; us[nu++] = u1;
+    vs[nv++] = v0; vs[nv++] = v1;
+    for (int i = 0; i < worldNumPatches; i++) {
+        const Patch *p = &worldPatches[i];
+        if (p->surf != s || p->u1 <= u0 || p->u0 >= u1 || p->v1 <= v0 || p->v0 >= v1)
+            continue;
+        nu = addEdges(us, nu, u0, u1, p->u0, p->u1);
+        nv = addEdges(vs, nv, v0, v1, p->v0, p->v1);
+    }
+    sortEdges(us, nu);
+    sortEdges(vs, nv);
+
+    for (int j = 0; j + 1 < nv; j++) {
+        if (vs[j + 1] - vs[j] < 0.001f) continue;
+        for (int i = 0; i + 1 < nu; i++) {
+            if (us[i + 1] - us[i] < 0.001f) continue;
+            float uc = (us[i] + us[i + 1]) * 0.5f, vc = (vs[j] + vs[j + 1]) * 0.5f;
+            RGB c = base;
+            for (int k = 0; k < worldNumPatches; k++) {
+                const Patch *p = &worldPatches[k];
+                if (p->surf == s && uc > p->u0 && uc < p->u1 && vc > p->v0 && vc < p->v1) {
+                    c.r = p->r; c.g = p->g; c.b = p->b;
+                }
+            }
+            float cu[4] = { us[i], us[i], us[i + 1], us[i + 1] };
+            float cv[4] = { vs[j], vs[j + 1], vs[j + 1], vs[j] };
+            RQuad *q = addQuad(surfPoint(s, cu[0], cv[0]), surfPoint(s, cu[1], cv[1]),
+                               surfPoint(s, cu[2], cv[2]), surfPoint(s, cu[3], cv[3]));
+            if (!q) return;
+            u16 col[4];
+            for (int k = 0; k < 4; k++)
+                col[k] = shadeRGB(c.r, c.g, c.b, surfShade(s, cv[k]));
+            quadColor(q, col[0], col[1], col[2], col[3]);
+        }
+    }
+}
+
 static void bakeRoom(void)
 {
-    /* checkered wooden floor, 0.5 m tiles */
-    const float t = 0.5f;
+    const MapInfo *m = world;
+    const bool in = m->indoor;
+
+    /* floor: checkered wood indoors, mown grass stripes outdoors */
+    const float t = in ? 0.5f : 2.0f;
+    const RGB fa = in ? (RGB){ 176, 120, 72 } : (RGB){ 74, 146, 62 };
+    const RGB fb = in ? (RGB){ 152, 96, 56 }  : (RGB){ 62, 128, 52 };
     int ix = 0;
-    for (float x = ROOM_MIN_X; x < ROOM_MAX_X - 0.01f; x += t, ix++) {
+    for (float x = m->minX; x < m->maxX - 0.01f; x += t, ix++) {
         int iz = 0;
-        for (float z = ROOM_MIN_Z; z < ROOM_MAX_Z - 0.01f; z += t, iz++) {
-            RQuad *q = addQuad(v3(x, 0, z), v3(x, 0, z + t), v3(x + t, 0, z + t), v3(x + t, 0, z));
-            u16 c = ((ix + iz) & 1) ? RGB15(22, 15, 9) : RGB15(19, 12, 7);
-            quadColor(q, c, c, c, c);
-        }
+        for (float z = m->minZ; z < m->maxZ - 0.01f; z += t, iz++)
+            bakeTile(SURF_FLOOR, x, z, x + t, z + t, ((ix + iz) & 1) ? fa : fb);
     }
 
-    /* walls: darker at the bottom for a bit of ambient occlusion feel,
-     * split into vertical strips so long walls clip nicely */
-    struct { float x0, z0, x1, z1; int r, g, b; } walls[4] = {
-        { ROOM_MIN_X, ROOM_MIN_Z, ROOM_MAX_X, ROOM_MIN_Z, 236, 222, 180 }, /* back  */
-        { ROOM_MAX_X, ROOM_MAX_Z, ROOM_MIN_X, ROOM_MAX_Z, 236, 222, 180 }, /* front */
-        { ROOM_MIN_X, ROOM_MAX_Z, ROOM_MIN_X, ROOM_MIN_Z, 180, 205, 220 }, /* left  */
-        { ROOM_MAX_X, ROOM_MIN_Z, ROOM_MAX_X, ROOM_MAX_Z, 180, 205, 220 }, /* right */
+    /* walls (a hedge outdoors), split into vertical strips so long walls clip nicely */
+    const RGB wallCol[4] = {
+        in ? (RGB){ 236, 222, 180 } : (RGB){ 48, 110, 46 },   /* back  */
+        in ? (RGB){ 236, 222, 180 } : (RGB){ 48, 110, 46 },   /* front */
+        in ? (RGB){ 180, 205, 220 } : (RGB){ 44, 102, 42 },   /* left  */
+        in ? (RGB){ 180, 205, 220 } : (RGB){ 44, 102, 42 },   /* right */
     };
     for (int w = 0; w < 4; w++) {
-        const int strips = 4;
-        u16 lo = shadeRGB(walls[w].r, walls[w].g, walls[w].b, 18);
-        u16 hi = shadeRGB(walls[w].r, walls[w].g, walls[w].b, 31);
-        for (int s = 0; s < strips; s++) {
-            float a = (float)s / strips, b = (float)(s + 1) / strips;
-            float xa = walls[w].x0 + (walls[w].x1 - walls[w].x0) * a;
-            float za = walls[w].z0 + (walls[w].z1 - walls[w].z0) * a;
-            float xb = walls[w].x0 + (walls[w].x1 - walls[w].x0) * b;
-            float zb = walls[w].z0 + (walls[w].z1 - walls[w].z0) * b;
-            RQuad *q = addQuad(v3(xa, 0, za), v3(xa, ROOM_H, za), v3(xb, ROOM_H, zb), v3(xb, 0, zb));
-            quadColor(q, lo, hi, hi, lo);
-        }
-        /* skirting board */
-        float bx0 = walls[w].x0, bz0 = walls[w].z0, bx1 = walls[w].x1, bz1 = walls[w].z1;
-        RQuad *q = addQuad(v3(bx0, 0, bz0), v3(bx0, 0.08f, bz0), v3(bx1, 0.08f, bz1), v3(bx1, 0, bz1));
-        u16 sk = RGB15(29, 29, 29);
-        quadColor(q, sk, sk, sk, sk);
+        Surface s = (Surface)(SURF_BACK + w);
+        float a = w < 2 ? m->minX : m->minZ, b = w < 2 ? m->maxX : m->maxZ;
+        const int strips = in ? 4 : 8;
+        for (int k = 0; k < strips; k++)
+            bakeTile(s, a + (b - a) * k / strips, 0.0f, a + (b - a) * (k + 1) / strips,
+                     m->wallH, wallCol[w]);
     }
 
-    /* ceiling, brighter near the lamp */
-    u16 cEdge = RGB15(22, 22, 21), cMid = RGB15(30, 30, 28);
-    float xs[3] = { ROOM_MIN_X, 0.0f, ROOM_MAX_X };
-    float zs[3] = { ROOM_MIN_Z, 0.0f, ROOM_MAX_Z };
-    for (int i = 0; i < 2; i++)
-        for (int j = 0; j < 2; j++) {
-            RQuad *q = addQuad(v3(xs[i], ROOM_H, zs[j]), v3(xs[i + 1], ROOM_H, zs[j]),
-                               v3(xs[i + 1], ROOM_H, zs[j + 1]), v3(xs[i], ROOM_H, zs[j + 1]));
-            /* the centre vertex of the ceiling (above the lamp) is the bright one */
-            u16 c[4];
-            Vec3 vv[4] = { {xs[i],0,zs[j]}, {xs[i+1],0,zs[j]}, {xs[i+1],0,zs[j+1]}, {xs[i],0,zs[j+1]} };
-            for (int k = 0; k < 4; k++)
-                c[k] = (vv[k].x == 0.0f && vv[k].z == 0.0f) ? cMid : cEdge;
-            quadColor(q, c[0], c[1], c[2], c[3]);
-        }
+    if (in) {
+        /* ceiling, brighter near the lamp */
+        u16 cEdge = RGB15(22, 22, 21), cMid = RGB15(30, 30, 28);
+        float xs[3] = { m->minX, 0.0f, m->maxX };
+        float zs[3] = { m->minZ, 0.0f, m->maxZ };
+        for (int i = 0; i < 2; i++)
+            for (int j = 0; j < 2; j++) {
+                RQuad *q = addQuad(v3(xs[i], m->ceilH, zs[j]), v3(xs[i + 1], m->ceilH, zs[j]),
+                                   v3(xs[i + 1], m->ceilH, zs[j + 1]), v3(xs[i], m->ceilH, zs[j + 1]));
+                /* the centre vertex of the ceiling (above the lamp) is the bright one */
+                u16 c[4];
+                Vec3 vv[4] = { {xs[i],0,zs[j]}, {xs[i+1],0,zs[j]}, {xs[i+1],0,zs[j+1]}, {xs[i],0,zs[j+1]} };
+                for (int k = 0; k < 4; k++)
+                    c[k] = (vv[k].x == 0.0f && vv[k].z == 0.0f) ? cMid : cEdge;
+                quadColor(q, c[0], c[1], c[2], c[3]);
+            }
+        return;
+    }
+
+    /* outdoors: give the hedge a top and an outer face, and lay a field
+     * around it so there is ground to see when flying above the hedge */
+    const float th = 0.6f, H = m->wallH, F = 30.0f;
+    float x0 = m->minX, x1 = m->maxX, z0 = m->minZ, z1 = m->maxZ;
+    u16 top = shadeRGB(48, 110, 46, 34), side = shadeRGB(48, 110, 46, 22);
+    u16 sideLo = shadeRGB(48, 110, 46, 14);
+    /* tops */
+    quadColor(addQuad(v3(x0 - th, H, z0 - th), v3(x1 + th, H, z0 - th), v3(x1 + th, H, z0), v3(x0 - th, H, z0)), top, top, top, top);
+    quadColor(addQuad(v3(x0 - th, H, z1), v3(x1 + th, H, z1), v3(x1 + th, H, z1 + th), v3(x0 - th, H, z1 + th)), top, top, top, top);
+    quadColor(addQuad(v3(x0 - th, H, z0), v3(x0, H, z0), v3(x0, H, z1), v3(x0 - th, H, z1)), top, top, top, top);
+    quadColor(addQuad(v3(x1, H, z0), v3(x1 + th, H, z0), v3(x1 + th, H, z1), v3(x1, H, z1)), top, top, top, top);
+    /* outer faces */
+    quadColor(addQuad(v3(x0 - th, 0, z0 - th), v3(x0 - th, H, z0 - th), v3(x1 + th, H, z0 - th), v3(x1 + th, 0, z0 - th)), sideLo, side, side, sideLo);
+    quadColor(addQuad(v3(x0 - th, 0, z1 + th), v3(x0 - th, H, z1 + th), v3(x1 + th, H, z1 + th), v3(x1 + th, 0, z1 + th)), sideLo, side, side, sideLo);
+    quadColor(addQuad(v3(x0 - th, 0, z0 - th), v3(x0 - th, H, z0 - th), v3(x0 - th, H, z1 + th), v3(x0 - th, 0, z1 + th)), sideLo, side, side, sideLo);
+    quadColor(addQuad(v3(x1 + th, 0, z0 - th), v3(x1 + th, H, z0 - th), v3(x1 + th, H, z1 + th), v3(x1 + th, 0, z1 + th)), sideLo, side, side, sideLo);
+    /* surrounding fields */
+    u16 fc = RGB15(9, 16, 6), fn = RGB15(13, 20, 9);
+    float ox0 = x0 - th, ox1 = x1 + th, oz0 = z0 - th, oz1 = z1 + th;
+    quadColor(addQuad(v3(-F, 0, -F), v3(F, 0, -F), v3(F, 0, oz0), v3(-F, 0, oz0)), fc, fc, fn, fn);
+    quadColor(addQuad(v3(-F, 0, oz1), v3(F, 0, oz1), v3(F, 0, F), v3(-F, 0, F)), fn, fn, fc, fc);
+    quadColor(addQuad(v3(-F, 0, oz0), v3(ox0, 0, oz0), v3(ox0, 0, oz1), v3(-F, 0, oz1)), fc, fn, fn, fc);
+    quadColor(addQuad(v3(ox1, 0, oz0), v3(F, 0, oz0), v3(F, 0, oz1), v3(ox1, 0, oz1)), fn, fc, fc, fn);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -192,6 +303,9 @@ static u16 glyph(char ch)
     case '%': return G(05, 01, 02, 04, 05);
     case '/': return G(01, 01, 02, 04, 04);
     case '!': return G(02, 02, 02, 00, 02);
+    case '<': return G(01, 02, 04, 02, 01);
+    case '>': return G(04, 02, 01, 02, 04);
+    case ',': return G(00, 00, 00, 02, 04);
     default:  return 0;
     }
 }
@@ -350,16 +464,27 @@ void renderInit(void)
 
     glInit();
     glEnable(GL_ANTIALIAS);
-    glClearColor(4, 4, 6, 31);
     glClearPolyID(63);
     glClearDepth(0x7FFF);
     glViewport(0, 0, 255, 191);
-    BG_PALETTE_SUB[0] = RGB15(31, 0, 31);   /* boot stage: 3D up, baking */
+}
+
+void renderBake(void)
+{
+    if (world->indoor) glClearColor(4, 4, 6, 31);
+    else               glClearColor(15, 22, 31, 31);   /* sky */
 
     numRQuads = 0;
     bakeRoom();
     for (int i = 0; i < worldNumBoxes; i++)
         bakeBox(&worldBoxes[i]);
+}
+
+static void loadProjection(void)
+{
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    gluPerspective(78, 256.0f / 192.0f, 0.03f, world->indoor ? 12.0f : 45.0f);
 }
 
 static void loadCamera(const Quad *q)
@@ -381,28 +506,25 @@ static void loadCamera(const Quad *q)
     glLoadMatrix4x4(&m);
 }
 
-static u16 gateColor(const Game *g, int gate, int shade)
+static u16 gateColor(int nextGate, int gate, int shade)
 {
-    if (gate == g->nextGate)  return shadeRGB(60, 255, 90, shade);    /* next: green  */
-    if (gate == (g->nextGate + 1) % worldNumGates)
-                              return shadeRGB(255, 200, 40, shade);   /* after: yellow */
-    return shadeRGB(255, 90, 30, shade);                              /* others       */
+    if (gate == nextGate)  return shadeRGB(60, 255, 90, shade);    /* next: green  */
+    if (gate == (nextGate + 1) % worldNumGates)
+                           return shadeRGB(255, 200, 40, shade);   /* after: yellow */
+    return shadeRGB(255, 90, 30, shade);                           /* others       */
 }
 
-void renderFrame(const Game *g)
+/* Draws the baked scene with the camera already in the modelview matrix. */
+static void drawScene(int nextGate)
 {
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    gluPerspective(78, 256.0f / 192.0f, 0.03f, 12.0f);
-
+    glScalef32(inttof32(WORLD_SCALE), inttof32(WORLD_SCALE), inttof32(WORLD_SCALE));
     glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(1));
-    loadCamera(&g->quad);
 
     glBegin(GL_QUADS);
     for (int i = 0; i < numRQuads; i++) {
         const RQuad *q = &rquads[i];
         if (q->gate >= 0) {
-            glColor(gateColor(g, q->gate, q->shade));
+            glColor(gateColor(nextGate, q->gate, q->shade));
             for (int k = 0; k < 4; k++)
                 glVertex3v16(q->v[k][0], q->v[k][1], q->v[k][2]);
         } else {
@@ -413,9 +535,54 @@ void renderFrame(const Game *g)
         }
     }
     glEnd();
+}
+
+void renderFrame(const Game *g)
+{
+    loadProjection();
+    loadCamera(&g->quad);
+    drawScene(g->nextGate);
 
     glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(2));
     drawOSD(g);
+
+    glFlush(0);
+}
+
+/* Map select: slow orbit around the selected map, with the menu on top. */
+void renderMenu(const Game *g, int frame)
+{
+    const MapInfo *m = world;
+    float a = frame * 0.004f;
+    float rad = m->indoor ? 1.9f : 10.0f, h = m->indoor ? 1.9f : 6.0f;
+    float cx = (m->minX + m->maxX) * 0.5f, cz = (m->minZ + m->maxZ) * 0.5f;
+
+    loadProjection();
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    gluLookAt(cx + rad * cosf(a), h, cz + rad * sinf(a), cx, m->indoor ? 0.6f : 1.0f, cz, 0.0f, 1.0f, 0.0f);
+    drawScene(0);
+
+    glPolyFmt(POLY_ALPHA(31) | POLY_CULL_NONE | POLY_ID(2));
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrthof32(0, inttof32(4), inttof32(3), 0, inttof32(-1), inttof32(1));
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    glBegin(GL_QUADS);
+    osdTextCentered(8, 3, RGB15(31, 31, 31), "WHOOPDSI");
+    osdTextCentered(32, 2, RGB15(31, 31, 10), "SELECT MAP");
+    for (int i = 0; i < MAP_COUNT; i++) {
+        char buf[24];
+        bool sel = i == g->menuSel;
+        sprintf(buf, sel ? "> %s <" : "%s", mapInfo[i].name);
+        osdTextCentered(70 + i * 30, sel ? 3 : 2, sel ? RGB15(10, 31, 12) : RGB15(24, 24, 24), buf);
+    }
+    osdTextCentered(140, 1, RGB15(31, 31, 31), mapInfo[g->menuSel].desc);
+    if ((frame / 30) & 1)
+        osdTextCentered(170, 2, RGB15(31, 24, 4), "PRESS A TO FLY");
+    glEnd();
 
     glFlush(0);
 }

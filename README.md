@@ -6,7 +6,10 @@ A tiny-whoop FPV drone simulator for the Nintendo DSi and DS, built as homebrew.
 
 - **Top screen:** the FPV camera view (DS 3D engine, 15° camera uptilt) with an OSD showing mode, arm state, lap timer, throttle bar, speed and the next gate.
 - **Bottom screen:** flight data (lap, last and best lap, gate, speed, altitude, throttle) and a live monitor of the two sticks.
-- **Environment:** a 6 × 5 × 2.6 m living room with a table, couch, bed, bookshelf, boxes, a plant and a hanging lamp. Four race gates form a counter-clockwise loop. The next gate is green and the one after it is yellow.
+- **Map select:** the game opens on a map select screen with a rotating preview of each map. Pick **INDOOR** or **OUTDOOR** with Up/Down (or tap it on the bottom screen) and press A or START (or tap it again) to fly. In flight, hold SELECT for one second to come back to the menu. Lap times are kept per map.
+- **Indoor:** a 6 × 5 × 2.6 m living room with a table, couch, bed, bookshelf, boxes, a plant, a hanging lamp, a window and a door. Four race gates form a counter-clockwise loop.
+- **Outdoor:** a 24 × 20 m back garden surrounded by a 2.4 m hedge, with trees, a pond, a shed, a patio with a picnic table and tyre stacks. Six bigger gates (1 m openings) form a loop. Above the hedge and at the 9 m flight ceiling there is a soft net that stops the quad without counting as a crash.
+- **Gates:** the next gate is green and the one after it is yellow.
 - **Physics:** a 65 mm whoop with about 2.6:1 thrust-to-weight, drag, and Betaflight-style acro rates. Angle mode self-levels. Collisions bounce the quad off surfaces, and a hard hit (over 3.2 m/s) is a crash.
 
 ## Controls (Mode 2)
@@ -21,6 +24,7 @@ A tiny-whoop FPV drone simulator for the Nintendo DSi and DS, built as homebrew.
 | L | Switch between Angle and Acro mode |
 | R | Throttle cut (sets the throttle to 0) |
 | SELECT | Reset to the start pad |
+| Hold SELECT (1 s) | Back to the map select screen |
 | Tap touch screen | Cycle speed: SLOW → MEDIUM → FAST |
 
 The DS has no analog sticks, so every stick axis ramps smoothly. A tap gives a small correction, and holding the button builds up to full deflection over about 0.3 s. The throttle also moves faster the longer you hold Up or Down. Hover is around **36%** throttle on FAST.
@@ -63,8 +67,10 @@ If devkitPro is installed locally (`DEVKITARM` set), plain `make` works too.
 | `source/main.c` | Main loop, arming, crash handling, lap and gate logic |
 | `source/input.c` | Maps the buttons to stick values with ramping and expo |
 | `source/quad.c` | Flight physics and the Angle/Acro controllers |
-| `source/world.c` | Room, furniture and gate layout, collisions, gate crossing |
-| `source/render.c` | 3D scene (baked into fixed-point quads), FPV camera, OSD pixel font |
-| `source/hud.c` | Bottom-screen text console and stick monitor |
+| `source/world.c` | Map definitions (indoor and outdoor): bounds, furniture, wall/floor patches, gates, collisions, gate crossing |
+| `source/render.c` | 3D scene (baked into fixed-point quads), FPV camera, map select preview, OSD pixel font |
+| `source/hud.c` | Bottom-screen text console, map menu and stick monitor |
+
+To add a map, add an entry to `MapId` and `mapInfo[]` in `world.h`/`world.c` and a `build...()` function that places boxes (`SOLID`/`DECO`), flat `patch()`es on the floor or walls, a `startPad()` and `gate()`s. Flat details such as doors, windows, rugs and pictures should be patches, not thin boxes: patches are cut into the floor/wall mesh so they share its lighting and can't z-fight with it.
 
 To tune the feel, edit the `speeds[]` table and `#define`s at the top of `quad.c` (rates, thrust-to-weight, drag, lean angle), `input.c` (ramp speed, expo) and `quad.h` (camera uptilt).

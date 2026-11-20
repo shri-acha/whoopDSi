@@ -5,7 +5,13 @@
 #include "quad.h"
 #include "input.h"
 
+typedef enum { STATE_MENU, STATE_FLY } GameState;
+
 typedef struct {
+    GameState state;
+    int    menuSel;     /* map highlighted on the select screen          */
+    int    map;         /* MapId of the map currently loaded             */
+
     Quad   quad;
     Sticks sticks;
 

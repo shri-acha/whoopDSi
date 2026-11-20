@@ -14,6 +14,9 @@
 #define THR_RATE_MAX 0.90f
 
 static float thrHoldTime;
+static float selHoldTime;
+
+#define MENU_HOLD 1.0f   /* seconds SELECT must be held to open the map menu */
 
 static float ramp(float v, int target, float dt)
 {
@@ -45,7 +48,9 @@ void inputInit(Sticks *s)
     s->yaw = s->pitch = s->roll = 0.0f;
     s->rawYaw = s->rawPitch = s->rawRoll = 0.0f;
     s->armToggle = s->modeToggle = s->reset = s->throttleCut = s->speedToggle = false;
+    s->menu = false;
     thrHoldTime = 0.0f;
+    selHoldTime = 0.0f;
 }
 
 void inputUpdate(Sticks *s, float dt)
@@ -87,4 +92,14 @@ void inputUpdate(Sticks *s, float dt)
     s->throttleCut = (down & KEY_R) != 0;
     s->speedToggle = (down & KEY_TOUCH) != 0;
     if (s->throttleCut) s->throttle = 0.0f;
+
+    /* fires once, the moment SELECT has been held for MENU_HOLD */
+    s->menu = false;
+    if (held & KEY_SELECT) {
+        float before = selHoldTime;
+        selHoldTime += dt;
+        s->menu = before < MENU_HOLD && selHoldTime >= MENU_HOLD;
+    } else {
+        selHoldTime = 0.0f;
+    }
 }

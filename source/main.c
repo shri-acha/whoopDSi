@@ -22,10 +22,9 @@ static Game game;
 /* Boot-stage indicator: paints both screens' backdrop a solid colour.
  * Normally each colour is only visible for a frame or two; if the program
  * ever hangs during start-up, the colour tells you where:
- *   red     = main() reached, building the world
- *   yellow  = world built, starting the 3D engine
- *   magenta = 3D engine initialised, baking the scene (bottom screen)
- *   cyan    = scene baked, setting up the bottom screen HUD
+ *   red     = main() reached
+ *   yellow  = starting the 3D engine, then building and baking the map
+ *   cyan    = map baked, setting up the bottom screen HUD
  * A completely white screen means main() was never reached (launcher issue). */
 static void bootStage(u16 color)
 {
@@ -74,6 +73,54 @@ static void gateLogic(Vec3 prev, Vec3 cur)
     game.nextGate = (game.nextGate + 1) % worldNumGates;
 }
 
+/* Builds a map and bakes it for the renderer. Lap records are per map. */
+static void loadMap(int map)
+{
+    if (map == game.map) return;
+    game.map = map;
+    worldInit((MapId)map);
+    renderBake();
+    game.lastFrames = -1;
+    game.bestFrames = -1;
+    game.laps = 0;
+}
+
+static void openMenu(void)
+{
+    game.quad.armed = false;
+    game.state = STATE_MENU;
+    game.menuSel = game.map;
+}
+
+/* Map select screen: Up/Down or a tap picks the map, A or START flies it. */
+static void updateMenu(void)
+{
+    u32 down = keysDown();
+    int sel = game.menuSel;
+
+    if (down & KEY_UP)   sel = (sel + MAP_COUNT - 1) % MAP_COUNT;
+    if (down & KEY_DOWN) sel = (sel + 1) % MAP_COUNT;
+    bool fly = (down & (KEY_A | KEY_START)) != 0;
+    if (down & KEY_TOUCH) {
+        touchPosition t;
+        touchRead(&t);
+        int hit = hudMenuHit(t.py);
+        if (hit >= 0) {
+            fly = hit == sel;   /* tap once to pick, tap again to fly */
+            sel = hit;
+        }
+    }
+
+    if (sel != game.menuSel) {
+        game.menuSel = sel;
+        loadMap(sel);          /* rebake so the preview shows it */
+    }
+    if (fly) {
+        game.state = STATE_FLY;
+        resetRun(true);
+    }
+}
+
 static void update(void)
 {
     Sticks *s = &game.sticks;
@@ -81,6 +128,14 @@ static void update(void)
 
     inputUpdate(s, DT);
 
+    if (game.state == STATE_MENU) {
+        updateMenu();
+        return;
+    }
+    if (s->menu) {
+        openMenu();
+        return;
+    }
     if (s->reset) {
         resetRun(true);
         return;
@@ -131,9 +186,10 @@ int main(void)
     videoSetMode(MODE_0_2D);
     videoSetModeSub(MODE_0_2D);
     bootStage(RGB15(31, 0, 0));
-    worldInit();
+    game.map = -1;
     bootStage(RGB15(31, 31, 0));
     renderInit();
+    loadMap(MAP_INDOOR);
     bootStage(RGB15(0, 31, 31));
     hudInit();
     BG_PALETTE[0] = RGB15(0, 0, 0);
@@ -141,15 +197,14 @@ int main(void)
     inputInit(&game.sticks);
     game.quad.mode = MODE_ANGLE;
     game.quad.speed = SPEED_SLOW;
-    game.lastFrames = -1;
-    game.bestFrames = -1;
-    game.laps = 0;
     resetRun(false);
+    openMenu();
 
     int frame = 0;
     while (pmMainLoop()) {
         update();
-        renderFrame(&game);
+        if (game.state == STATE_MENU) renderMenu(&game, frame);
+        else                          renderFrame(&game);
         hudUpdate(&game, frame++);
         swiWaitForVBlank();
     }
